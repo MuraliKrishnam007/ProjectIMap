@@ -33,6 +33,7 @@ OrderDto dto = mapper.Map<Order, OrderDto>(order);   // that's it
 - [Error model](#-error-model)
 - [Cheat sheet (for humans & AI agents)](#-cheat-sheet-for-humans--ai-agents)
 - [Performance notes](#-performance-notes)
+- [Version history](#%EF%B8%8F-version-history)
 - [License](#-license)
 
 ---
@@ -487,6 +488,18 @@ Dest dest = mapper.Map<Source, Dest>(source);
 - **The inferred `Map<TDst>(src)` overload is opt-in convenience** — it adds one
   `GetType()` + cache lookup (~15% on a trivial 4-property map, measured ~9M vs
   ~10M ops/s); the explicit two-generic path is byte-for-byte unchanged.
+
+---
+
+## 🗒️ Version history
+
+| Version | Highlights |
+|---|---|
+| **6.0.0** | Multi-targets **net8.0 + net10.0** (per-TFM dependencies); new boilerplate-free `Map<TDestination>(source)` overload with runtime source-type inference (collections, LINQ sequences, and `Include<>` polymorphism all supported); explicit-overload hot path unchanged. |
+| **5.1.x** | `Include<>` polymorphic dispatch extended to collection elements and nested members; standalone documentation. |
+| **5.0.0** | DI-resolved value resolvers (`MapFrom<TResolver,TMember>()`), `ForAllMembers`, identity-based collection diffing (`EqualityComparison`). |
+| **4.0.0** | Collection merge, `FlattenDepth`, `IValueResolver` classes, `Include<>` polymorphic mapping, recursive configuration validation. |
+| **3.0.0** | Map-into-existing, `ConstructUsing`, `Condition`/`NullSubstitute`, `BeforeMap`/`AfterMap`, `MaxDepth`, `AssertConfigurationIsValid`. |
 
 ---
 
