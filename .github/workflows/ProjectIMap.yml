@@ -41,11 +41,12 @@ jobs:
       - name: Test (all target frameworks)
         run: dotnet test ProjectIMap.Tests/ProjectIMap.Tests.csproj -c Release
 
-      - name: Pack (Release)
+      - name: Pack (Release, deterministic)
         run: >
           dotnet pack ProjectIMap/ProjectIMap.csproj
           -c Release
           -p:GeneratePackageOnBuild=false
+          -p:ContinuousIntegrationBuild=true
           -o ${{ github.workspace }}/artifacts
 
       - name: NuGet login (Trusted Publishing / OIDC)

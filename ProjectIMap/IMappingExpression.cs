@@ -136,6 +136,28 @@ namespace ProjectIMap
         IMappingExpression<TSource, TDestination> AfterMap(Action<TSource, TDestination> action);
 
         /// <summary>
+        /// Registers a class-based, DI-resolved BeforeMap hook: a fresh
+        /// <typeparamref name="TAction"/> is resolved from the <see cref="Mapper"/>'s
+        /// <see cref="IServiceProvider"/> on every map call and its
+        /// <see cref="IMappingAction{TSource,TDestination}.Process"/> invoked.
+        /// </summary>
+        /// <remarks>
+        /// Hooks accumulate: inline-delegate and class-based hooks may be mixed
+        /// freely and all run in registration order. Requires a
+        /// <c>Mapper(configuration, serviceProvider)</c>-constructed mapper (or one
+        /// resolved from a DI container); mapping throws otherwise.
+        /// </remarks>
+        IMappingExpression<TSource, TDestination> BeforeMap<TAction>()
+            where TAction : IMappingAction<TSource, TDestination>;
+
+        /// <summary>
+        /// Registers a class-based, DI-resolved AfterMap hook.
+        /// See <see cref="BeforeMap{TAction}"/> for resolution semantics.
+        /// </summary>
+        IMappingExpression<TSource, TDestination> AfterMap<TAction>()
+            where TAction : IMappingAction<TSource, TDestination>;
+
+        /// <summary>
         /// Overrides how many times this (source, destination) pair may appear on
         /// the nested-object DFS recursion stack before being treated as a cycle.
         /// </summary>

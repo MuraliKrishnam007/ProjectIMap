@@ -41,9 +41,14 @@ namespace ProjectIMap
     /// </remarks>
     public static class ProjectionCompiler
     {
-        // Projection lambdas are cached per type-pair so each pair is analysed
-        // and reified at most once, even under concurrent access.
-        private static readonly ConcurrentDictionary<(Type, Type), LambdaExpression> _cache = new();
+        // Projection lambdas are cached per type-pair PER CONFIGURATION. Keying by
+        // the configuration (weakly, so a discarded config doesn't leak its cache)
+        // matters because the same type pair can be registered with different
+        // ForMember/ConvertUsing/depth settings in different configurations — a
+        // single static (Type,Type) cache would leak one configuration's compiled
+        // projection into another's queries.
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+            MapperConfiguration, ConcurrentDictionary<(Type, Type), LambdaExpression>> _caches = new();
 
         // Trie cache is separate from Mapper's: both are populated identically on
         // first access and then reused, so there is no correctness concern in having
@@ -80,7 +85,8 @@ namespace ProjectIMap
                     $"Call CreateMap<{source.Name}, {dest.Name}>() in your MapperConfiguration " +
                     $"before calling ProjectTo.");
 
-            return _cache.GetOrAdd((source, dest), _ => BuildProjectionCore(source, dest, config));
+            var cache = _caches.GetOrCreateValue(config);
+            return cache.GetOrAdd((source, dest), _ => BuildProjectionCore(source, dest, config));
         }
 
         // ── Core builder ─────────────────────────────────────────────────────────
@@ -101,8 +107,30 @@ namespace ProjectIMap
             }
             else
             {
+                NewExpression newExpr;
+                HashSet<string>? consumed = null;
+                if (dest.GetConstructor(Type.EmptyTypes) is not null)
+                {
+                    newExpr = Expression.New(dest);
+                }
+                else
+                {
+                    // Constructor-parameter mapping (positional records / immutable
+                    // types). EF Core translates NewExpression arguments in
+                    // projections, so this stays SQL-compatible.
+                    newExpr = TryBuildParameterizedProjectionConstructor(
+                                  source, dest, param, config, out consumed)
+                        ?? throw new InvalidOperationException(
+                            $"Destination type '{dest.Name}' has no public parameterless constructor, " +
+                            $"no ConstructUsing(...) registered for '{source.Name} -> {dest.Name}', " +
+                            $"and no public constructor whose parameters all match source properties by name.");
+                }
+
                 var bindings = BuildProjectionBindings(source, dest, param, new Dictionary<(Type, Type), int>(), config);
-                body = Expression.MemberInit(Expression.New(dest), bindings);
+                if (consumed is { Count: > 0 })
+                    bindings.RemoveAll(b => consumed.Contains(b.Member.Name));
+
+                body = Expression.MemberInit(newExpr, bindings);
             }
 
             // Produce Expression<Func<TSource, TDest>> (not a plain LambdaExpression)
@@ -185,7 +213,7 @@ namespace ProjectIMap
                         var substituteConst = Expression.Constant(mo.NullSubstituteValue, mo.NullSubstituteType!);
 
                         if (!TryAdaptProjectionExpression(
-                                substituteConst, mo.NullSubstituteType!, valueType!, out var adaptedSubstitute))
+                                substituteConst, mo.NullSubstituteType!, valueType!, config, out var adaptedSubstitute))
                             adaptedSubstitute = substituteConst;
 
                         valueExpr = Expression.Condition(
@@ -195,7 +223,7 @@ namespace ProjectIMap
                     }
 
                     if (!TryAdaptProjectionExpression(
-                            valueExpr, valueType!, destProp.PropertyType, out var adapted)) continue;
+                            valueExpr, valueType!, destProp.PropertyType, config, out var adapted)) continue;
 
                     // A per-member Condition is a CASE WHEN, exactly like the
                     // Mapper/MemberInit path — there is no "existing instance" concept
@@ -220,9 +248,21 @@ namespace ProjectIMap
 
                     // Scalar / numeric / enum / nullable — fast path.
                     if (TryAdaptProjectionExpression(
-                            srcAccess, srcProp.PropertyType, destProp.PropertyType, out var adapted))
+                            srcAccess, srcProp.PropertyType, destProp.PropertyType, config, out var adapted))
                     {
                         bindings.Add(Expression.Bind(destProp, adapted!));
+                        boundDestNames.Add(destProp.Name);
+                        continue;
+                    }
+
+                    // Collection-typed member pair — a nested .Select(...) projection
+                    // (SQL-translatable). Must run BEFORE nested-object recursion.
+                    var nestedCollection = TryBuildCollectionProjection(
+                        srcProp.PropertyType, destProp.PropertyType,
+                        srcAccess, visitedPath, config);
+                    if (nestedCollection is not null)
+                    {
+                        bindings.Add(Expression.Bind(destProp, nestedCollection));
                         boundDestNames.Add(destProp.Name);
                         continue;
                     }
@@ -245,7 +285,7 @@ namespace ProjectIMap
                             srcExpr, sourceTrie, destProp.Name,
                             out var flatExpr, out var flatType)) continue;
                     if (!TryAdaptProjectionExpression(
-                            flatExpr!, flatType!, destProp.PropertyType, out var adapted)) continue;
+                            flatExpr!, flatType!, destProp.PropertyType, config, out var adapted)) continue;
 
                     bindings.Add(Expression.Bind(destProp, adapted!));
                     boundDestNames.Add(destProp.Name);
@@ -261,7 +301,7 @@ namespace ProjectIMap
                     if (subType.GetConstructor(Type.EmptyTypes) is null)      continue;
 
                     var subBindings = BuildUnflattenProjectionBindings(
-                        srcExpr, sourceIndex, destProp.Name, subType);
+                        srcExpr, sourceIndex, config, destProp.Name, subType);
                     if (subBindings.Count == 0) continue;
 
                     bindings.Add(Expression.Bind(
@@ -300,8 +340,8 @@ namespace ProjectIMap
             if (srcType.IsValueType || srcType == typeof(string)) return null;
             if (dstType.IsValueType || dstType == typeof(string)) return null;
 
-            var hasCustomCtor = config.TryGetCustomConstructor(srcType, dstType, out var customCtor);
-            if (!hasCustomCtor && dstType.GetConstructor(Type.EmptyTypes) is null) return null;
+            var hasCustomCtor    = config.TryGetCustomConstructor(srcType, dstType, out var customCtor);
+            var hasParameterless = dstType.GetConstructor(Type.EmptyTypes) is not null;
 
             if (hasCustomCtor)
                 return InlineLambdaBody(customCtor!, srcExpr);
@@ -311,10 +351,162 @@ namespace ProjectIMap
             if (currentDepth >= maxDepth)
                 return Expression.Constant(null, dstType);
 
-            var nestedBindings = BuildProjectionBindings(srcType, dstType, srcExpr, visitedPath, config);
-            if (nestedBindings.Count == 0) return null;
+            NewExpression? newExpr;
+            HashSet<string>? consumed = null;
+            if (hasParameterless)
+            {
+                newExpr = Expression.New(dstType);
+            }
+            else
+            {
+                newExpr = TryBuildParameterizedProjectionConstructor(
+                    srcType, dstType, srcExpr, config, out consumed);
+                if (newExpr is null) return null;   // not constructible — skip binding
+            }
 
-            return Expression.MemberInit(Expression.New(dstType), nestedBindings);
+            var nestedBindings = BuildProjectionBindings(srcType, dstType, srcExpr, visitedPath, config);
+            if (consumed is { Count: > 0 })
+                nestedBindings.RemoveAll(b => consumed.Contains(b.Member.Name));
+            if (nestedBindings.Count == 0 && newExpr.Arguments.Count == 0) return null;
+
+            return Expression.MemberInit(newExpr, nestedBindings);
+        }
+
+        /// <summary>
+        /// EF-safe mirror of the runtime engine's constructor-parameter mapping:
+        /// matches every parameter of a public constructor to a source property by
+        /// name (case-insensitive), adapting values with
+        /// <see cref="TryAdaptProjectionExpression"/> so the resulting
+        /// <see cref="NewExpression"/> stays SQL-translatable.
+        /// </summary>
+        private static NewExpression? TryBuildParameterizedProjectionConstructor(
+            Type                sourceType,
+            Type                destType,
+            Expression          srcExpr,
+            MapperConfiguration config,
+            out HashSet<string> consumedNames)
+        {
+            consumedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sourceIndex = BuildSourceIndex(sourceType);
+
+            foreach (var ctor in destType.GetConstructors().OrderByDescending(c => c.GetParameters().Length))
+            {
+                var parameters = ctor.GetParameters();
+                if (parameters.Length == 0) continue;
+
+                var args    = new List<Expression>(parameters.Length);
+                var matched = new List<string>(parameters.Length);
+                var usable  = true;
+
+                foreach (var parameter in parameters)
+                {
+                    if (parameter.Name is null ||
+                        !sourceIndex.TryGetValue(parameter.Name.ToUpperInvariant(), out var sourceProp))
+                    {
+                        usable = false;
+                        break;
+                    }
+
+                    Expression access = Expression.Property(srcExpr, sourceProp);
+                    if (!TryAdaptProjectionExpression(
+                            access, sourceProp.PropertyType, parameter.ParameterType, config, out var adapted))
+                    {
+                        usable = false;
+                        break;
+                    }
+
+                    args.Add(adapted!);
+                    matched.Add(parameter.Name);
+                }
+
+                if (!usable) continue;
+
+                foreach (var name in matched)
+                    consumedNames.Add(name);
+                return Expression.New(ctor, args);
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Builds a nested <c>.Select(...)</c> projection for a collection-typed
+        /// member pair — e.g. <c>Order.Lines: List&lt;OrderLine&gt;</c> →
+        /// <c>OrderDto.Lines: List&lt;OrderLineDto&gt;</c> becomes
+        /// <c>src.Lines.Select(l =&gt; new OrderLineDto { … }).ToList()</c>, which EF
+        /// Core translates to a correlated subquery. No null guard is emitted:
+        /// relational providers materialize absent children as empty sets, and a
+        /// guard would require a <c>Block</c>, which is not SQL-translatable.
+        /// </summary>
+        private static Expression? TryBuildCollectionProjection(
+            Type                          srcPropType,
+            Type                          dstPropType,
+            Expression                    srcExpr,
+            Dictionary<(Type, Type), int> visitedPath,
+            MapperConfiguration           config)
+        {
+            if (srcPropType == typeof(string) || dstPropType == typeof(string)) return null;
+            if (srcPropType.IsValueType || dstPropType.IsValueType) return null;
+            if (!Mapper.TryGetCollectionElementType(srcPropType, out var srcElem) ||
+                !Mapper.TryGetCollectionElementType(dstPropType, out var dstElem)) return null;
+
+            var iEnumerableSrc = typeof(IEnumerable<>).MakeGenericType(srcElem);
+            var funcType       = typeof(Func<,>).MakeGenericType(srcElem, dstElem);
+
+            // ── Per-element projection strategy ──────────────────────────────────
+            LambdaExpression? selector = null;   // null ⇒ identity (no Select emitted)
+            if (srcElem != dstElem)
+            {
+                var elemParam = Expression.Parameter(srcElem, "elem");
+                if (TryAdaptProjectionExpression(elemParam, srcElem, dstElem, config, out var adaptedElem))
+                {
+                    selector = Expression.Lambda(funcType, adaptedElem!, elemParam);
+                }
+                else if (!srcElem.IsValueType && !dstElem.IsValueType)
+                {
+                    var elemInit = TryBuildNestedProjection(srcElem, dstElem, elemParam, visitedPath, config);
+                    if (elemInit is null) return null;
+                    selector = Expression.Lambda(funcType, elemInit, elemParam);
+                }
+                else
+                {
+                    return null;
+                }
+            }
+
+            Expression seq = srcPropType == iEnumerableSrc
+                ? srcExpr
+                : Expression.Convert(srcExpr, iEnumerableSrc);
+
+            if (selector is not null)
+            {
+                var selectMethod = typeof(Enumerable)
+                    .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .First(m => m.Name == nameof(Enumerable.Select)
+                             && m.GetParameters() is { Length: 2 } ps
+                             && ps[1].ParameterType.IsGenericType
+                             && ps[1].ParameterType.GetGenericTypeDefinition() == typeof(Func<,>))
+                    .MakeGenericMethod(srcElem, dstElem);
+                seq = Expression.Call(selectMethod, seq, selector);
+            }
+
+            // ── Materialize (ToList / ToArray only — both EF-translatable) ────────
+            if (dstPropType.IsArray)
+            {
+                var toArray = typeof(Enumerable).GetMethod(nameof(Enumerable.ToArray))!.MakeGenericMethod(dstElem);
+                return Expression.Call(toArray, seq);
+            }
+
+            if (dstPropType.IsAssignableFrom(typeof(List<>).MakeGenericType(dstElem)))
+            {
+                var toList = typeof(Enumerable).GetMethod(nameof(Enumerable.ToList))!.MakeGenericMethod(dstElem);
+                Expression materialized = Expression.Call(toList, seq);
+                if (materialized.Type != dstPropType)
+                    materialized = Expression.Convert(materialized, dstPropType);
+                return materialized;
+            }
+
+            return null;
         }
 
         // ── Unflattening helper ──────────────────────────────────────────────────
@@ -322,6 +514,7 @@ namespace ProjectIMap
         private static List<MemberBinding> BuildUnflattenProjectionBindings(
             Expression                       srcExpr,
             Dictionary<string, PropertyInfo> sourceIndex,
+            MapperConfiguration              config,
             string                           destPropName,
             Type                             subType)
         {
@@ -338,7 +531,7 @@ namespace ProjectIMap
 
                 Expression srcAccess = Expression.Property(srcExpr, srcProp);
                 if (!TryAdaptProjectionExpression(
-                        srcAccess, srcProp.PropertyType, subProp.PropertyType, out var adapted))
+                        srcAccess, srcProp.PropertyType, subProp.PropertyType, config, out var adapted))
                     continue;
 
                 subBindings.Add(Expression.Bind(subProp, adapted!));
@@ -438,11 +631,28 @@ namespace ProjectIMap
         /// </list>
         /// </remarks>
         private static bool TryAdaptProjectionExpression(
-            Expression      srcExpr,
-            Type            sourceType,
-            Type            destType,
-            out Expression? result)
+            Expression          srcExpr,
+            Type                sourceType,
+            Type                destType,
+            MapperConfiguration config,
+            out Expression?     result)
         {
+            // ── Global ConvertUsing converter (precedence over every built-in rule) ─
+            // The user lambda is inlined, so it remains SQL-translatable if its body
+            // is. Null sources propagate as default via a ternary (CASE WHEN in SQL)
+            // instead of reaching the lambda — same contract as the runtime engine.
+            if (config.TryGetTypeConverter(sourceType, destType, out var converter))
+            {
+                var inlined = InlineLambdaBody(converter!, srcExpr);
+                result = CanBeNull(sourceType)
+                    ? Expression.Condition(
+                          Expression.Equal(srcExpr, Expression.Constant(null, sourceType)),
+                          Expression.Default(destType),
+                          inlined)
+                    : inlined;
+                return true;
+            }
+
             // ── Identical / directly assignable ──────────────────────────────────
             if (destType.IsAssignableFrom(sourceType))
             {

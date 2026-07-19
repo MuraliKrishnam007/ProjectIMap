@@ -176,6 +176,147 @@ public sealed class AnimalOwnerDto
     public AnimalDto? Pet  { get; set; }
 }
 
+// ── Invoice — nested collection property mapping (v7.0) ──────────────────────
+public sealed class InvoiceLine
+{
+    public string Sku { get; set; } = string.Empty;
+    public int    Qty { get; set; }
+}
+
+public sealed class InvoiceLineDto
+{
+    public string Sku { get; set; } = string.Empty;
+    public int    Qty { get; set; }
+}
+
+public sealed class Invoice
+{
+    public int                Id    { get; set; }
+    public List<InvoiceLine>? Lines { get; set; }
+    public List<int>          Codes { get; set; } = [];
+}
+
+public sealed class InvoiceDto
+{
+    public int                   Id    { get; set; }
+    public List<InvoiceLineDto>? Lines { get; set; }
+    public int[]                 Codes { get; set; } = [];
+}
+
+// ── TreeNode — self-referencing collection graph (v7.0) ──────────────────────
+public sealed class TreeNode
+{
+    public string         Name     { get; set; } = string.Empty;
+    public List<TreeNode> Children { get; set; } = [];
+}
+
+public sealed class TreeNodeDto
+{
+    public string            Name     { get; set; } = string.Empty;
+    public List<TreeNodeDto> Children { get; set; } = [];
+}
+
+// ── Zoo — polymorphic elements inside a nested collection (v7.0) ─────────────
+public sealed class Zoo
+{
+    public string       Name    { get; set; } = string.Empty;
+    public List<Animal> Animals { get; set; } = [];
+}
+
+public sealed class ZooDto
+{
+    public string          Name    { get; set; } = string.Empty;
+    public List<AnimalDto> Animals { get; set; } = [];
+}
+
+// ── Blog/Post — nested collection projection, dedicated to ProjectTo tests ───
+public sealed class Post
+{
+    public string Heading { get; set; } = string.Empty;
+    public int    Views   { get; set; }
+}
+
+public sealed class PostDto
+{
+    public string Heading { get; set; } = string.Empty;
+    public int    Views   { get; set; }
+}
+
+public sealed class Blog
+{
+    public int        Id    { get; set; }
+    public string     Title { get; set; } = string.Empty;
+    public List<Post> Posts { get; set; } = [];
+}
+
+public sealed class BlogDto
+{
+    public int           Id    { get; set; }
+    public string        Title { get; set; } = string.Empty;
+    public List<PostDto> Posts { get; set; } = [];
+}
+
+public sealed record BlogSummaryDto(int Id, string Title);
+
+// ── Constructor-parameter mapping (v7.0) ─────────────────────────────────────
+public sealed class CtorSource
+{
+    public int    Id    { get; set; }
+    public string Name  { get; set; } = string.Empty;
+    public string Extra { get; set; } = string.Empty;
+}
+
+public sealed record CtorPersonDto(int Id, string Name);
+
+public sealed record CtorPersonWithExtraDto(int Id, string Name)
+{
+    public string Extra { get; set; } = string.Empty;
+}
+
+public sealed class PointSource
+{
+    public int X { get; set; }
+    public int Y { get; set; }
+}
+
+public sealed class ImmutablePoint
+{
+    public ImmutablePoint(int x, int y) { X = x; Y = y; }
+    public int X { get; }
+    public int Y { get; }
+}
+
+public sealed class Shape
+{
+    public string      Label { get; set; } = string.Empty;
+    public PointSource? Point { get; set; }
+}
+
+public sealed class ShapeDto
+{
+    public string          Label { get; set; } = string.Empty;
+    public ImmutablePoint? Point { get; set; }
+}
+
+public sealed class UnmatchableDto
+{
+    public UnmatchableDto(string missingEverywhere) => Code = missingEverywhere;
+    public string Code { get; }
+}
+
+// ── ConvertUsing global type converters (v7.0) ───────────────────────────────
+public sealed class ExternalRef
+{
+    public string CorrelationId { get; set; } = string.Empty;
+    public string Label         { get; set; } = string.Empty;
+}
+
+public sealed class ExternalRefDto
+{
+    public Guid   CorrelationId { get; set; }
+    public string Label         { get; set; } = string.Empty;
+}
+
 // ── Employee / EmployeeDto — used by ValueResolverTests ──────────────────────
 
 public sealed class Employee

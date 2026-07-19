@@ -64,6 +64,15 @@ namespace ProjectIMap
             => _innerConfig.CreateMap<TSource, TDestination>();
 
         /// <summary>
+        /// Registers a global type converter from within this profile — merged into
+        /// the global configuration alongside the profile's <c>CreateMap</c> calls.
+        /// See <see cref="MapperConfiguration.ConvertUsing{TValueSource,TValueDestination}"/>.
+        /// </summary>
+        protected void ConvertUsing<TValueSource, TValueDestination>(
+            System.Linq.Expressions.Expression<Func<TValueSource, TValueDestination>> conversion)
+            => _innerConfig.ConvertUsing(conversion);
+
+        /// <summary>
         /// Transfers all type-pair registrations collected by this profile into
         /// <paramref name="configuration"/>.
         /// </summary>

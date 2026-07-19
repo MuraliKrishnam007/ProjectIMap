@@ -51,14 +51,30 @@ namespace ProjectIMap
         /// <inheritdoc/>
         public IMappingExpression<TSource, TDestination> BeforeMap(Action<TSource, TDestination> action)
         {
-            _configuration.SetBeforeMap(typeof(TSource), typeof(TDestination), action);
+            _configuration.AddBeforeMap(typeof(TSource), typeof(TDestination), action);
             return this;
         }
 
         /// <inheritdoc/>
         public IMappingExpression<TSource, TDestination> AfterMap(Action<TSource, TDestination> action)
         {
-            _configuration.SetAfterMap(typeof(TSource), typeof(TDestination), action);
+            _configuration.AddAfterMap(typeof(TSource), typeof(TDestination), action);
+            return this;
+        }
+
+        /// <inheritdoc/>
+        public IMappingExpression<TSource, TDestination> BeforeMap<TAction>()
+            where TAction : IMappingAction<TSource, TDestination>
+        {
+            _configuration.AddBeforeMap(typeof(TSource), typeof(TDestination), typeof(TAction));
+            return this;
+        }
+
+        /// <inheritdoc/>
+        public IMappingExpression<TSource, TDestination> AfterMap<TAction>()
+            where TAction : IMappingAction<TSource, TDestination>
+        {
+            _configuration.AddAfterMap(typeof(TSource), typeof(TDestination), typeof(TAction));
             return this;
         }
 

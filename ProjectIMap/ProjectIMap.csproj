@@ -8,7 +8,7 @@
 
     <!-- NuGet package identity -->
     <PackageId>ProjectIMap</PackageId>
-    <Version>6.0.0</Version>
+    <Version>7.0.0</Version>
     <Authors>ProjectIMap Contributors</Authors>
     <Title>ProjectIMap</Title>
     <Description>
@@ -38,6 +38,13 @@
       boilerplate-free Map&lt;TDestination&gt;(source) overload that infers the source
       type from the object's runtime type — dispatch is resolved once, compiled, and
       cached, and the explicit two-generic path is unchanged.
+      v7.0 maps nested collection properties (Order.Lines: List&lt;OrderLine&gt; to
+      List&lt;OrderLineDto&gt;) in both the runtime engine and ProjectTo (as a
+      SQL-translatable nested Select), constructs positional records and immutable
+      ctor-only types by matching constructor parameters to source properties with
+      zero configuration, adds global null-safe ConvertUsing type converters, lets
+      BeforeMap/AfterMap hooks accumulate, and adds DI-resolved IMappingAction
+      classes. Ships SourceLink, symbol packages, and deterministic CI builds.
     </Description>
     <PackageTags>mapper;dto;expression-tree;object-mapping;performance;dependency-injection</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -49,6 +56,14 @@
     <!-- Build output -->
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+    <!-- Robust packaging: SourceLink debugging, symbol package, deterministic
+         builds, and NuGet package validation on every pack. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EnablePackageValidation>true</EnablePackageValidation>
     <!-- Suppress CS1591 (missing XML doc) globally; tighten per-project as needed -->
     <NoWarn>$(NoWarn);1591</NoWarn>
     <PackageIcon>JuniorJr.png</PackageIcon>
@@ -73,6 +88,10 @@
   </ItemGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 
 </Project>

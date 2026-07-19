@@ -201,17 +201,47 @@ namespace ProjectIMap
                     $"No mapping registered from '{sourceType.Name}' to '{destType.Name}'. " +
                     $"Call CreateMap<{sourceType.Name}, {destType.Name}>() in your MapperConfiguration.");
 
-            if (_configuration.TryGetBeforeMap(sourceType, destType, out var before))
-                ((Action<TSource, TDestination>)before!)(source, destination);
+            InvokeHooks(_configuration.GetBeforeMaps(sourceType, destType), source, destination);
 
             var assignAction = (Action<TSource, TDestination>)_compiledAssign.GetOrAdd(
                 (sourceType, destType), _ => CompileAssignment<TSource, TDestination>(_configuration, _serviceProvider, this));
             assignAction(source, destination);
 
-            if (_configuration.TryGetAfterMap(sourceType, destType, out var after))
-                ((Action<TSource, TDestination>)after!)(source, destination);
+            InvokeHooks(_configuration.GetAfterMaps(sourceType, destType), source, destination);
 
             return destination;
+        }
+
+        /// <summary>
+        /// Runs every registered hook entry for a pair in registration order.
+        /// Delegate entries are invoked directly; <see cref="Type"/> entries are
+        /// DI-resolved <see cref="IMappingAction{TSource,TDestination}"/> classes —
+        /// a fresh instance per map call (correct for scoped/transient dependencies).
+        /// </summary>
+        private void InvokeHooks<TSource, TDestination>(
+            object[] hooks, TSource source, TDestination destination)
+        {
+            foreach (var entry in hooks)
+            {
+                if (entry is Delegate del)
+                {
+                    ((Action<TSource, TDestination>)del)(source, destination);
+                    continue;
+                }
+
+                var actionType = (Type)entry;
+                if (_serviceProvider is null)
+                    throw new InvalidOperationException(
+                        $"The pair '{typeof(TSource).Name} -> {typeof(TDestination).Name}' registers the " +
+                        $"DI-resolved mapping action '{actionType.Name}', but this Mapper was constructed " +
+                        $"without an IServiceProvider. Use 'new Mapper(configuration, serviceProvider)' " +
+                        $"or resolve IMapper from your DI container.");
+
+                var action = (IMappingAction<TSource, TDestination>)
+                    Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions
+                        .GetRequiredService(_serviceProvider, actionType);
+                action.Process(source, destination);
+            }
         }
 
         /// <inheritdoc/>
@@ -320,8 +350,7 @@ namespace ProjectIMap
                 (sourceType, destType), _ => CompileConstructor<TSource, TDestination>(_configuration));
             var destination = constructFunc(source);
 
-            if (_configuration.TryGetBeforeMap(sourceType, destType, out var before))
-                ((Action<TSource, TDestination>)before!)(source, destination);
+            InvokeHooks(_configuration.GetBeforeMaps(sourceType, destType), source, destination);
 
             if (!hasCustomCtor)
             {
@@ -330,8 +359,7 @@ namespace ProjectIMap
                 assignAction(source, destination);
             }
 
-            if (_configuration.TryGetAfterMap(sourceType, destType, out var after))
-                ((Action<TSource, TDestination>)after!)(source, destination);
+            InvokeHooks(_configuration.GetAfterMaps(sourceType, destType), source, destination);
 
             return destination;
         }
@@ -435,6 +463,221 @@ namespace ProjectIMap
                 return baseMapper(element);
             };
         }
+
+        /// <summary>
+        /// Lazily-resolved element mapper used inside compiled nested-collection
+        /// bindings. Resolution is deferred to the first mapped element rather than
+        /// compile time for two reasons: it makes self-referencing collection graphs
+        /// (e.g. <c>TreeNode.Children: List&lt;TreeNode&gt;</c>) safe — an eager
+        /// <c>GetOrAdd</c> during compilation would re-enter the cache for the key
+        /// currently being computed and recurse forever — and it means the element
+        /// pair's delegate is shared with (not duplicated from) the normal element
+        /// cache. After the first call it is a single field read + invoke.
+        /// </summary>
+        private sealed class DeferredElementMapper<TSrcElem, TDstElem>
+        {
+            private readonly Mapper _owner;
+            private Func<TSrcElem, TDstElem>? _inner;   // benign race: same value either way
+
+            public DeferredElementMapper(Mapper owner) => _owner = owner;
+
+            public TDstElem Map(TSrcElem element)
+                => (_inner ??= (Func<TSrcElem, TDstElem>)_owner.GetOrAddElementMapper(
+                        typeof(TSrcElem), typeof(TDstElem)))(element);
+        }
+
+        /// <summary>
+        /// Builds a null-guarded expression that maps a collection-typed source
+        /// member to a collection-typed destination member with differing (or
+        /// converted) element types — e.g. <c>Order.Lines: List&lt;OrderLine&gt;</c> →
+        /// <c>OrderDto.Lines: List&lt;OrderLineDto&gt;</c>. Runs in Phase 1 before
+        /// nested-object recursion, which would otherwise mis-treat the collection
+        /// as a complex object.
+        /// </summary>
+        /// <remarks>
+        /// Element handling, in order:
+        /// <list type="bullet">
+        ///   <item>identical element types → materialized directly, no per-element call;</item>
+        ///   <item>scalar-adaptable elements (numeric widening, enum, nullable,
+        ///   ConvertUsing) → the adaptation is inlined into the <c>Select</c> lambda;</item>
+        ///   <item>complex element pairs → routed through
+        ///   <see cref="DeferredElementMapper{TSrcElem,TDstElem}"/>, which shares the
+        ///   polymorphism-aware element cache (a derived element still maps to its
+        ///   derived DTO).</item>
+        /// </list>
+        /// Destination materialization supports arrays (<c>ToArray</c>), anything
+        /// assignable from <c>List&lt;T&gt;</c> (<c>ToList</c>), and any collection
+        /// exposing an <c>IEnumerable&lt;T&gt;</c> constructor (e.g. <c>HashSet&lt;T&gt;</c>,
+        /// <c>ObservableCollection&lt;T&gt;</c>). Returns <see langword="null"/> when
+        /// the member is not a mappable collection pair, letting later phases try.
+        /// </remarks>
+        private static Expression? TryBuildNestedCollectionExpression(
+            Type                srcPropType,
+            Type                dstPropType,
+            Expression          srcExpr,
+            MapperConfiguration configuration,
+            Mapper?             owner)
+        {
+            if (owner is null) return null;
+            if (srcPropType == typeof(string) || dstPropType == typeof(string)) return null;
+            // Struct sequences (e.g. ImmutableArray<T>) can't take the null-guard below.
+            if (srcPropType.IsValueType || dstPropType.IsValueType) return null;
+            if (!TryGetCollectionElementType(srcPropType, out var srcElem) ||
+                !TryGetCollectionElementType(dstPropType, out var dstElem)) return null;
+
+            var funcType       = typeof(Func<,>).MakeGenericType(srcElem, dstElem);
+            var iEnumerableSrc = typeof(IEnumerable<>).MakeGenericType(srcElem);
+            var iEnumerableDst = typeof(IEnumerable<>).MakeGenericType(dstElem);
+
+            // ── Per-element mapping strategy ─────────────────────────────────────
+            Expression? selectorExpr = null;   // null ⇒ identity (no Select emitted)
+            if (srcElem != dstElem)
+            {
+                var elemParam = Expression.Parameter(srcElem, "elem");
+                if (TryAdaptExpression(elemParam, srcElem, dstElem, configuration, out var adaptedElem))
+                {
+                    selectorExpr = Expression.Lambda(funcType, adaptedElem!, elemParam);
+                }
+                else if (!srcElem.IsValueType && !dstElem.IsValueType)
+                {
+                    var deferredType = typeof(DeferredElementMapper<,>).MakeGenericType(srcElem, dstElem);
+                    var deferred     = Activator.CreateInstance(deferredType, owner)!;
+                    var mapDelegate  = Delegate.CreateDelegate(
+                        funcType, deferred, deferredType.GetMethod(nameof(DeferredElementMapper<object, object>.Map))!);
+                    selectorExpr = Expression.Constant(mapDelegate, funcType);
+                }
+                else
+                {
+                    return null;   // e.g. List<int> → List<DateTime> with no converter
+                }
+            }
+
+            // ── Sequence: tmp (null-guarded below), optionally .Select(selector) ──
+            var tempVar    = Expression.Variable(srcPropType, "_coll");
+            var assignTemp = Expression.Assign(tempVar, srcExpr);
+
+            Expression seq = srcPropType == iEnumerableSrc
+                ? tempVar
+                : Expression.Convert(tempVar, iEnumerableSrc);
+
+            if (selectorExpr is not null)
+            {
+                var selectMethod = typeof(Enumerable)
+                    .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .First(m => m.Name == nameof(Enumerable.Select)
+                             && m.GetParameters() is { Length: 2 } ps
+                             && ps[1].ParameterType.IsGenericType
+                             && ps[1].ParameterType.GetGenericTypeDefinition() == typeof(Func<,>))
+                    .MakeGenericMethod(srcElem, dstElem);
+                seq = Expression.Call(selectMethod, seq, selectorExpr);
+            }
+
+            // ── Materialize to the destination collection type ────────────────────
+            Expression materialized;
+            if (dstPropType.IsArray)
+            {
+                var toArray = typeof(Enumerable).GetMethod(nameof(Enumerable.ToArray))!.MakeGenericMethod(dstElem);
+                materialized = Expression.Call(toArray, seq);
+            }
+            else if (dstPropType.IsAssignableFrom(typeof(List<>).MakeGenericType(dstElem)))
+            {
+                var toList = typeof(Enumerable).GetMethod(nameof(Enumerable.ToList))!.MakeGenericMethod(dstElem);
+                materialized = Expression.Call(toList, seq);
+                if (materialized.Type != dstPropType)
+                    materialized = Expression.Convert(materialized, dstPropType);
+            }
+            else if (dstPropType.GetConstructor([iEnumerableDst]) is { } seqCtor)
+            {
+                materialized = Expression.New(seqCtor, seq);
+            }
+            else
+            {
+                return null;   // destination collection shape we can't materialize
+            }
+
+            // { var _coll = src.Prop; _coll == null ? (TDest)null : <materialized> }
+            var conditional = Expression.Condition(
+                Expression.Equal(tempVar, Expression.Constant(null, srcPropType)),
+                Expression.Constant(null, dstPropType),
+                materialized);
+
+            return Expression.Block(dstPropType, [tempVar], assignTemp, conditional);
+        }
+
+        // ── Constructor-parameter mapping ────────────────────────────────────────
+
+        /// <summary>
+        /// For a destination type with no public parameterless constructor (and no
+        /// <c>ConstructUsing</c>), attempts to build a <see cref="NewExpression"/>
+        /// by matching every parameter of a public constructor to a source property
+        /// by name (case-insensitive), adapting types with the full
+        /// <see cref="TryAdaptExpression"/> pipeline (ConvertUsing included). This is
+        /// what makes positional records and immutable ctor-only types map with zero
+        /// configuration. Constructors are tried greediest-first; the first one whose
+        /// parameters are all satisfiable wins. Returns <see langword="null"/> when
+        /// no constructor matches. <paramref name="consumedNames"/> receives the
+        /// matched parameter names so callers can exclude those members from
+        /// property binding (avoiding a redundant double-set on positional records).
+        /// </summary>
+        private static NewExpression? TryBuildParameterizedConstructor(
+            Type                sourceType,
+            Type                destType,
+            Expression          sourceExpr,
+            MapperConfiguration configuration,
+            out HashSet<string> consumedNames)
+        {
+            consumedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sourceIndex = BuildSourceIndex(sourceType);
+
+            foreach (var ctor in destType.GetConstructors().OrderByDescending(c => c.GetParameters().Length))
+            {
+                var parameters = ctor.GetParameters();
+                if (parameters.Length == 0) continue;   // parameterless is the caller's fast path
+
+                var args    = new List<Expression>(parameters.Length);
+                var matched = new List<string>(parameters.Length);
+                var usable  = true;
+
+                foreach (var parameter in parameters)
+                {
+                    if (parameter.Name is null ||
+                        !sourceIndex.TryGetValue(parameter.Name.ToUpperInvariant(), out var sourceProp))
+                    {
+                        usable = false;
+                        break;
+                    }
+
+                    Expression access = Expression.Property(sourceExpr, sourceProp);
+                    if (!TryAdaptExpression(access, sourceProp.PropertyType, parameter.ParameterType,
+                                            configuration, out var adapted))
+                    {
+                        usable = false;
+                        break;
+                    }
+
+                    args.Add(adapted!);
+                    matched.Add(parameter.Name);
+                }
+
+                if (!usable) continue;
+
+                foreach (var name in matched)
+                    consumedNames.Add(name);
+                return Expression.New(ctor, args);
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Cheap eligibility probe for <see cref="TryBuildParameterizedConstructor"/>
+        /// used by guards and validation, where no real source expression exists yet.
+        /// </summary>
+        private static bool HasParameterizedConstructorMatch(
+            Type sourceType, Type destType, MapperConfiguration configuration)
+            => TryBuildParameterizedConstructor(
+                   sourceType, destType, Expression.Parameter(sourceType, "probe"),
+                   configuration, out _) is not null;
 
         // ── Collection merge compilation ─────────────────────────────────────────
 
@@ -649,8 +892,31 @@ namespace ProjectIMap
             }
             else
             {
+                // Parameterless construction stays the fast default; otherwise match
+                // constructor parameters to source properties by name (positional
+                // records, immutable ctor-only types) with zero configuration.
+                NewExpression newExpr;
+                HashSet<string>? consumed = null;
+                if (destType.GetConstructor(Type.EmptyTypes) is not null)
+                {
+                    newExpr = Expression.New(destType);
+                }
+                else
+                {
+                    newExpr = TryBuildParameterizedConstructor(
+                                  sourceType, destType, sourceParam, configuration, out consumed)
+                        ?? throw new InvalidOperationException(
+                            $"Destination type '{destType.Name}' has no public parameterless constructor, " +
+                            $"no ConstructUsing(...) registered for '{sourceType.Name} -> {destType.Name}', " +
+                            $"and no public constructor whose parameters all match source properties by name. " +
+                            $"Add a ConstructUsing(...) or align constructor parameter names with source properties.");
+                }
+
                 var bindings = BuildBindings(sourceType, destType, sourceParam, visitedPath, configuration, serviceProvider, owner);
-                body = Expression.MemberInit(Expression.New(destType), bindings);
+                if (consumed is { Count: > 0 })
+                    bindings.RemoveAll(b => consumed.Contains(b.Member.Name));
+
+                body = Expression.MemberInit(newExpr, bindings);
             }
 
             var lambda = Expression.Lambda<Func<TSource, TDestination>>(body, sourceParam);
@@ -671,9 +937,18 @@ namespace ProjectIMap
             var destType    = typeof(TDestination);
             var sourceParam = Expression.Parameter(sourceType, "source");
 
-            Expression body = configuration.TryGetCustomConstructor(sourceType, destType, out var customCtor)
-                ? InlineLambdaBody(customCtor!, sourceParam)
-                : Expression.New(destType);
+            Expression body;
+            if (configuration.TryGetCustomConstructor(sourceType, destType, out var customCtor))
+                body = InlineLambdaBody(customCtor!, sourceParam);
+            else if (destType.GetConstructor(Type.EmptyTypes) is not null)
+                body = Expression.New(destType);
+            else
+                body = TryBuildParameterizedConstructor(
+                           sourceType, destType, sourceParam, configuration, out _)
+                    ?? throw new InvalidOperationException(
+                        $"Destination type '{destType.Name}' has no public parameterless constructor, " +
+                        $"no ConstructUsing(...) registered for '{sourceType.Name} -> {destType.Name}', " +
+                        $"and no public constructor whose parameters all match source properties by name.");
 
             return Expression.Lambda<Func<TSource, TDestination>>(body, sourceParam).Compile();
         }
@@ -835,7 +1110,7 @@ namespace ProjectIMap
                             memberOverride.NullSubstituteValue, memberOverride.NullSubstituteType!);
 
                         if (!TryAdaptExpression(
-                                substituteConst, memberOverride.NullSubstituteType!, valueType!, out var adaptedSubstitute))
+                                substituteConst, memberOverride.NullSubstituteType!, valueType!, configuration, out var adaptedSubstitute))
                             adaptedSubstitute = substituteConst;
 
                         valueExpr = Expression.Condition(
@@ -844,7 +1119,7 @@ namespace ProjectIMap
                             valueExpr);
                     }
 
-                    if (!TryAdaptExpression(valueExpr, valueType!, destProp.PropertyType, out var adapted)) continue;
+                    if (!TryAdaptExpression(valueExpr, valueType!, destProp.PropertyType, configuration, out var adapted)) continue;
 
                     plans.Add(new MemberBindingPlan(destProp, adapted!, memberOverride.ConditionExpression));
                 }
@@ -860,9 +1135,21 @@ namespace ProjectIMap
                     Expression sourceAccess = Expression.Property(sourceExpr, sourceProp);
 
                     // Fast path: scalar, enum, numeric, nullable, or directly assignable.
-                    if (TryAdaptExpression(sourceAccess, sourceProp.PropertyType, destProp.PropertyType, out var adapted))
+                    if (TryAdaptExpression(sourceAccess, sourceProp.PropertyType, destProp.PropertyType, configuration, out var adapted))
                     {
                         plans.Add(new MemberBindingPlan(destProp, adapted!, null));
+                        boundDestNames.Add(destProp.Name);
+                        continue;
+                    }
+
+                    // Collection-typed member pair (e.g. List<OrderLine> → List<OrderLineDto>):
+                    // must run BEFORE nested-object recursion, which would otherwise
+                    // treat the collection as a complex object and mis-map it.
+                    var nestedCollection = TryBuildNestedCollectionExpression(
+                        sourceProp.PropertyType, destProp.PropertyType, sourceAccess, configuration, owner);
+                    if (nestedCollection is not null)
+                    {
+                        plans.Add(new MemberBindingPlan(destProp, nestedCollection, null));
                         boundDestNames.Add(destProp.Name);
                         continue;
                     }
@@ -886,7 +1173,7 @@ namespace ProjectIMap
                             out var flatExpr, out var flatType))
                         continue;
 
-                    if (!TryAdaptExpression(flatExpr!, flatType!, destProp.PropertyType, out var adapted))
+                    if (!TryAdaptExpression(flatExpr!, flatType!, destProp.PropertyType, configuration, out var adapted))
                         continue;
 
                     plans.Add(new MemberBindingPlan(destProp, adapted!, null));
@@ -902,7 +1189,7 @@ namespace ProjectIMap
                     if (subType.IsValueType || subType == typeof(string)) continue;
                     if (subType.GetConstructor(Type.EmptyTypes) is null) continue;
 
-                    var subBindings = BuildUnflattenBindings(sourceExpr, sourceIndex, destProp.Name, subType);
+                    var subBindings = BuildUnflattenBindings(sourceExpr, sourceIndex, configuration, destProp.Name, subType);
                     if (subBindings.Count == 0) continue;
 
                     var subInit = Expression.MemberInit(Expression.New(subType), subBindings);
@@ -1046,8 +1333,10 @@ namespace ProjectIMap
                 return Expression.Block(dstType, [polyTmp], polyAssign, polyCond);
             }
 
-            var hasCustomCtor = configuration.TryGetCustomConstructor(srcType, dstType, out var customCtor);
-            if (!hasCustomCtor && dstType.GetConstructor(Type.EmptyTypes) is null) return null;
+            var hasCustomCtor      = configuration.TryGetCustomConstructor(srcType, dstType, out var customCtor);
+            var hasParameterless   = dstType.GetConstructor(Type.EmptyTypes) is not null;
+            if (!hasCustomCtor && !hasParameterless
+                && !HasParameterizedConstructorMatch(srcType, dstType, configuration)) return null;
 
             // ── Back-edge: cycle (or configured depth limit) reached ──────────────
             // Only applies to convention-based recursion: a ConstructUsing lambda
@@ -1072,15 +1361,26 @@ namespace ProjectIMap
             }
             else
             {
+                NewExpression newExpr;
+                HashSet<string>? consumed = null;
+                if (hasParameterless)
+                    newExpr = Expression.New(dstType);
+                else
+                    newExpr = TryBuildParameterizedConstructor(
+                                  srcType, dstType, tempVar, configuration, out consumed)!;
+
                 // Recurse — BuildBindingPlans will track (srcType, dstType) depth and
                 // backtrack when it returns.
                 var nestedBindings = BuildBindings(srcType, dstType, tempVar, visitedPath, configuration, serviceProvider, owner);
+                if (consumed is { Count: > 0 })
+                    nestedBindings.RemoveAll(b => consumed.Contains(b.Member.Name));
 
-                // No properties mapped (either nothing matched or depth-limited emptied
-                // the list). Skip the binding entirely rather than emitting a hollow `new DstType {}`.
-                if (nestedBindings.Count == 0) return null;
+                // Nothing mapped by either the constructor or convention (or depth-
+                // limiting emptied the list): skip the binding entirely rather than
+                // emitting a hollow `new DstType {}`.
+                if (nestedBindings.Count == 0 && newExpr.Arguments.Count == 0) return null;
 
-                constructedExpr = Expression.MemberInit(Expression.New(dstType), nestedBindings);
+                constructedExpr = Expression.MemberInit(newExpr, nestedBindings);
             }
 
             // { var _tmp = srcExpr; _tmp == null ? (DstType)null : <constructed> }
@@ -1203,7 +1503,7 @@ namespace ProjectIMap
         /// <see cref="string"/> is explicitly excluded even though it implements
         /// <c>IEnumerable&lt;char&gt;</c>.
         /// </summary>
-        private static bool TryGetCollectionElementType(Type type, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Type? elementType)
+        internal static bool TryGetCollectionElementType(Type type, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Type? elementType)
         {
             if (type == typeof(string))
             {
@@ -1407,6 +1707,7 @@ namespace ProjectIMap
         private static List<MemberBinding> BuildUnflattenBindings(
             Expression                       sourceParam,
             Dictionary<string, PropertyInfo> sourceIndex,
+            MapperConfiguration              configuration,
             string                           destPropName,
             Type                             subType)
         {
@@ -1422,7 +1723,7 @@ namespace ProjectIMap
                 if (!sourceIndex.TryGetValue(flatKey, out var sourceProp)) continue;
 
                 Expression sourceAccess = Expression.Property(sourceParam, sourceProp);
-                if (!TryAdaptExpression(sourceAccess, sourceProp.PropertyType, subProp.PropertyType, out var adapted))
+                if (!TryAdaptExpression(sourceAccess, sourceProp.PropertyType, subProp.PropertyType, configuration, out var adapted))
                     continue;
 
                 subBindings.Add(Expression.Bind(subProp, adapted!));
@@ -1466,11 +1767,30 @@ namespace ProjectIMap
         /// receives a null source.
         /// </remarks>
         private static bool TryAdaptExpression(
-            Expression      sourceExpr,
-            Type            sourceType,
-            Type            destType,
-            out Expression? result)
+            Expression          sourceExpr,
+            Type                sourceType,
+            Type                destType,
+            MapperConfiguration configuration,
+            out Expression?     result)
         {
+            // ── Global ConvertUsing converter (precedence over every built-in rule) ─
+            // Directive 1: converters never observe null — a null source value
+            // propagates as default(TDest) instead of invoking the user lambda,
+            // so `s => s.Trim()` is safe against null strings and null-guarded
+            // flattened chains.
+            if (configuration.TryGetTypeConverter(sourceType, destType, out var converter))
+            {
+                var inlined = InlineLambdaBody(converter!, sourceExpr);
+                var canBeNull = !sourceType.IsValueType || Nullable.GetUnderlyingType(sourceType) is not null;
+                result = canBeNull
+                    ? Expression.Condition(
+                          Expression.Equal(sourceExpr, Expression.Constant(null, sourceType)),
+                          Expression.Default(destType),
+                          inlined)
+                    : inlined;
+                return true;
+            }
+
             // ── Identical / directly assignable ──────────────────────────────────
             if (destType.IsAssignableFrom(sourceType))
             {
@@ -1756,11 +2076,13 @@ namespace ProjectIMap
             var pairLabel     = $"{sourceType.Name} -> {destType.Name}";
             var hasCustomCtor = configuration.TryGetCustomConstructor(sourceType, destType, out _);
 
-            if (!hasCustomCtor && destType.GetConstructor(Type.EmptyTypes) is null)
+            if (!hasCustomCtor && destType.GetConstructor(Type.EmptyTypes) is null
+                && !HasParameterizedConstructorMatch(sourceType, destType, configuration))
             {
                 errors.Add(
                     $"{pairLabel}: destination type '{destType.Name}' has no public parameterless " +
-                    $"constructor and no ConstructUsing(...) is registered for this pair.");
+                    $"constructor, no ConstructUsing(...) registered for this pair, and no public " +
+                    $"constructor whose parameters all match source properties by name.");
                 return; // construction itself is broken; member-level checks would be noise
             }
 
@@ -1803,7 +2125,13 @@ namespace ProjectIMap
                     // expression to check actual type compatibility, not just name presence.
                     if (TryAdaptExpression(
                             Expression.Default(namedSrcProp.PropertyType), namedSrcProp.PropertyType,
-                            destProp.PropertyType, out _))
+                            destProp.PropertyType, configuration, out _))
+                        continue;
+
+                    // Phase 1 collection pair (e.g. List<OrderLine> → List<OrderLineDto>):
+                    // valid when the engine's nested-collection binding would handle it.
+                    if (IsValidNestedCollectionPair(
+                            namedSrcProp.PropertyType, destProp.PropertyType, configuration))
                         continue;
 
                     // Phase 1 slow path: name matches but types aren't scalar-adaptable —
@@ -1826,7 +2154,7 @@ namespace ProjectIMap
                 var subType = destProp.PropertyType;
                 if (!subType.IsValueType && subType != typeof(string)
                     && subType.GetConstructor(Type.EmptyTypes) is not null
-                    && BuildUnflattenBindings(dummySource, sourceIndex, destProp.Name, subType).Count > 0)
+                    && BuildUnflattenBindings(dummySource, sourceIndex, configuration, destProp.Name, subType).Count > 0)
                     continue; // Phase 3: unflatten match
 
                 errors.Add(
@@ -1834,6 +2162,31 @@ namespace ProjectIMap
                     $"convention and has no ForMember(...) override. Add " +
                     $".ForMember(d => d.{destProp.Name}, opt => opt.Ignore()) if this is intentional.");
             }
+        }
+
+        /// <summary>
+        /// Mirrors <see cref="TryBuildNestedCollectionExpression"/>'s eligibility
+        /// rules for validation: a collection-typed member pair is valid when the
+        /// destination shape is materializable and the element types are identical,
+        /// scalar-adaptable (incl. ConvertUsing), or a complex class pair.
+        /// </summary>
+        private static bool IsValidNestedCollectionPair(
+            Type srcPropType, Type dstPropType, MapperConfiguration configuration)
+        {
+            if (srcPropType == typeof(string) || dstPropType == typeof(string)) return false;
+            if (srcPropType.IsValueType || dstPropType.IsValueType) return false;
+            if (!TryGetCollectionElementType(srcPropType, out var srcElem) ||
+                !TryGetCollectionElementType(dstPropType, out var dstElem)) return false;
+
+            var materializable =
+                dstPropType.IsArray
+                || dstPropType.IsAssignableFrom(typeof(List<>).MakeGenericType(dstElem))
+                || dstPropType.GetConstructor([typeof(IEnumerable<>).MakeGenericType(dstElem)]) is not null;
+            if (!materializable) return false;
+
+            if (srcElem == dstElem) return true;
+            if (TryAdaptExpression(Expression.Default(srcElem), srcElem, dstElem, configuration, out _)) return true;
+            return !srcElem.IsValueType && !dstElem.IsValueType;
         }
 
         /// <summary>
@@ -1855,7 +2208,8 @@ namespace ProjectIMap
             if (dstType.IsValueType || dstType == typeof(string)) return false;
 
             var hasCustomCtor = configuration.TryGetCustomConstructor(srcType, dstType, out _);
-            if (!hasCustomCtor && dstType.GetConstructor(Type.EmptyTypes) is null)
+            if (!hasCustomCtor && dstType.GetConstructor(Type.EmptyTypes) is null
+                && !HasParameterizedConstructorMatch(srcType, dstType, configuration))
                 return false; // not constructible — not a valid nested target
 
             if (hasCustomCtor)

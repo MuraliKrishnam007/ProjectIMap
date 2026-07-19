@@ -189,6 +189,43 @@ config.CreateMap<Order, OrderDto>().ReverseMap();  // and CustomerName → Custo
 Nested complex members with matching names are mapped **recursively by convention** —
 no extra registration needed (register the nested pair only when you want to customize it).
 
+### 🪆 Nested collection properties
+
+Collection-typed members with differing element types map element-by-element,
+automatically — the single most common entity/DTO shape:
+
+```csharp
+public class Order    { public List<OrderLine>    Lines { get; set; } }
+public class OrderDto { public List<OrderLineDto> Lines { get; set; } }
+
+config.CreateMap<Order, OrderDto>();   // Lines maps too — no extra registration
+```
+
+- Element pairs follow the same conventions as nested objects (registration only
+  needed to customize); polymorphic elements (`Include<>`) dispatch on runtime type.
+- Null source collections map to null; `List<T>`, arrays, interfaces assignable
+  from `List<T>`, and collections with an `IEnumerable<T>` constructor
+  (`HashSet<T>`, `ObservableCollection<T>`) all materialize correctly.
+- Self-referencing graphs (`TreeNode.Children: List<TreeNode>`) recurse safely.
+- `ProjectTo` emits the same shape as a **nested `.Select(...)`** — EF Core
+  translates it to a correlated subquery.
+
+### 🔁 Global type converters — `ConvertUsing`
+
+Registered once on the configuration, applied wherever a value of that type
+adapts — every pair, both engines:
+
+```csharp
+config.ConvertUsing<string, Guid>(s => Guid.Parse(s));
+config.ConvertUsing<DateTime, string>(d => d.ToString("O"));
+config.ConvertUsing<string, string>(s => s.Trim());   // yes — every string member
+```
+
+Converters take precedence over every built-in rule (including plain assignment)
+and are **null-safe by contract**: a null source value propagates as `default`
+without invoking your lambda. In `ProjectTo` the lambda is inlined, so it stays
+SQL-translatable if its body is.
+
 ### 🎛️ Per-member configuration — `ForMember`
 
 ```csharp
@@ -211,9 +248,24 @@ config.CreateMap<Order, OrderDto>()
 | `NullSubstitute(value)` | Fallback value when the source resolves to `null`. |
 | `MapFrom(resolverInstance)` / `MapFrom<TResolver, TMember>()` | See [Value resolvers](#-value-resolvers). |
 
-### 🏗️ Custom construction — `ConstructUsing`
+### 🏗️ Construction — records, immutable types, `ConstructUsing`
 
-For records, types without a parameterless constructor, or full construction control:
+Destinations **without a parameterless constructor** are constructed by matching
+constructor parameters to source properties by name — positional records and
+immutable types need zero configuration:
+
+```csharp
+public record PersonDto(int Id, string Name);          // positional record
+public class  Point { public Point(int x, int y) {…} } // ctor-only immutable
+
+config.CreateMap<Person, PersonDto>();   // just works — Id/Name matched to the ctor
+```
+
+Constructors are tried greediest-first; parameters go through full type
+adaptation (converters included); members the constructor consumed aren't
+double-set; remaining settable members still bind by convention.
+
+For **custom** construction logic, `ConstructUsing` remains available:
 
 ```csharp
 config.CreateMap<Person, PersonDto>()
@@ -228,11 +280,23 @@ config.CreateMap<Person, PersonDto>()
 ```csharp
 config.CreateMap<Order, OrderDto>()
       .BeforeMap((src, dest) => dest.AuditNote = "mapping…")   // dest constructed, not yet populated
-      .AfterMap((src, dest) => dest.AuditNote = $"mapped {DateTime.UtcNow}");
+      .AfterMap((src, dest) => dest.AuditNote = $"mapped {DateTime.UtcNow}")
+      .AfterMap<StampAudit>();   // class-based, resolved from DI on every call
+
+public sealed class StampAudit : IMappingAction<Order, OrderDto>
+{
+    private readonly IClock _clock;
+    public StampAudit(IClock clock) => _clock = clock;
+    public void Process(Order src, OrderDto dest) => dest.MappedAtUtc = _clock.UtcNow;
+}
 ```
 
-Execution order: `construct → BeforeMap → member assignments → AfterMap`.
-Hooks also fire on `Map(source, destination)`.
+Execution order: `construct → BeforeMap* → member assignments → AfterMap*`.
+Hooks **accumulate** — register as many as you need, inline delegates and
+`IMappingAction` classes freely mixed, all run in registration order. Class-based
+hooks resolve a fresh instance per map call (correct for scoped/transient
+dependencies) and require a DI-constructed mapper. Hooks also fire on
+`Map(source, destination)`.
 
 ### ♻️ Map into an existing instance
 
@@ -368,7 +432,13 @@ List<OrderDto> dtos = await db.Orders
 ```
 
 `ProjectTo` honors `ForMember(MapFrom/Ignore/Condition/NullSubstitute)`,
-`ConstructUsing`, flattening, and `FlattenDepth`.
+`ConstructUsing`, flattening, `FlattenDepth`, global `ConvertUsing` converters
+(inlined, so SQL-translatable), **nested collection properties** (emitted as a
+nested `.Select(...)` — a correlated subquery in SQL), and **constructor-parameter
+mapping** (EF Core translates `new Dto(x.A, x.B)` projections).
+
+Projections are cached **per configuration** — two configurations with different
+settings for the same pair never contaminate each other.
 
 > ⚠️ **Not available inside projections** (they cannot translate to SQL):
 > value resolvers, `BeforeMap`/`AfterMap` hooks, and runtime polymorphic dispatch.
@@ -400,19 +470,23 @@ A complete, minimal reference for implementing against this package.
 | `MapperConfiguration` | Registry. `CreateMap<TSrc,TDst>()`, `AssertConfigurationIsValid()`. |
 | `Mapper : IMapper` | Engine. `new Mapper(config)` or `new Mapper(config, serviceProvider)`. |
 | `IMapper` | `Map<TDst>(src)` (source type inferred) · `Map<TSrc,TDst>(src)` · `Map<TSrc,TDst>(src, dest)`. |
-| `MappingProfile` | Base class for scan-discovered profiles (`AddMyMapper(assembly)`). |
+| `MappingProfile` | Base class for scan-discovered profiles (`AddMyMapper(assembly)`); exposes `CreateMap` + `ConvertUsing`. |
 | `IValueResolver<TSrc,TMember>` | `TMember Resolve(TSrc source)`. |
+| `IMappingAction<TSrc,TDst>` | `void Process(TSrc source, TDst destination)` — DI-resolved hook class. |
 | `QueryableExtensions` | `queryable.ProjectTo<TDst>(config)`. |
 
 ### Fluent surface
 
 ```csharp
+config.ConvertUsing<TValSrc, TValDst>(v => expr);     // global converter, all pairs, null-safe
+
 config.CreateMap<TSrc, TDst>()
       .ReverseMap()                                   // also register TDst → TSrc
       .ForMember(d => d.X, opt => { ... })            // see member options below
       .ForAllMembers(opt => { ... })                  // blanket rule — call LAST
-      .ConstructUsing(s => new TDst(...))             // authoritative construction
-      .BeforeMap((s, d) => ...) .AfterMap((s, d) => ...)
+      .ConstructUsing(s => new TDst(...))             // authoritative custom construction
+      .BeforeMap((s, d) => ...) .AfterMap((s, d) => ...)   // accumulate, run in order
+      .BeforeMap<TAction>() .AfterMap<TAction>()      // IMappingAction, DI-resolved per call
       .Include<TDerivedSrc, TDerivedDst>()            // polymorphic dispatch
       .EqualityComparison((s, d) => bool)             // identity diff for merges
       .MaxDepth(int) .FlattenDepth(int);              // defaults: 1 and 5
@@ -428,30 +502,35 @@ opt.NullSubstitute(value);
 
 ### Rules & gotchas
 
-1. **Register top-level pairs and collection element pairs explicitly.** Nested complex
-   members map by convention without registration; register the nested pair only to
+1. **Register the pairs you call `Map`/`ProjectTo` with** (including top-level
+   collection maps' element pairs). Nested complex members AND nested collection
+   elements map by convention without registration; register a nested pair only to
    customize it.
 2. **`ConstructUsing` skips all convention binding** for that pair — the lambda builds
-   the whole object.
+   the whole object. Positional records / ctor-only types **don't need it**: constructor
+   parameters are matched to source properties by name automatically.
 3. **`ForAllMembers` must be the last configuration call** on a pair; it only fills
    members that have no override yet.
-4. **One `BeforeMap` and one `AfterMap` per pair** — registering a second replaces the
-   first.
-5. **DI resolvers** (`MapFrom<TResolver,TMember>()`) require `new Mapper(config,
-   serviceProvider)`; resolution is fresh per map call. Container-registered mappers get
-   this automatically.
+4. **Hooks accumulate** — every registered `BeforeMap`/`AfterMap` (inline or
+   `IMappingAction` class) runs, in registration order. Class-based hooks and DI
+   resolvers require `new Mapper(config, serviceProvider)`.
+5. **DI resolvers** (`MapFrom<TResolver,TMember>()`) resolve fresh per map call.
+   Container-registered mappers get the `IServiceProvider` automatically.
 6. **`Map(source, destination)` with collections** mutates the destination; it must be a
    mutable `ICollection<T>` (arrays throw). Default is clear+rebuild; `EqualityComparison`
-   on the *element* pair switches it to add/update/remove diffing.
+   on the *element* pair switches it to add/update/remove diffing. Nested collection
+   members are replaced wholesale, not merged.
 7. **`Include<>` derived pairs must themselves be registered.** Dispatch covers top-level
-   calls, collection elements, and nested members.
+   calls, collection elements (nested ones too), and nested members.
 8. **Self-referencing types** stop recursing at `MaxDepth` (default 1) — deeper
-   self-references map to `null`; raise `MaxDepth(n)` as needed.
+   self-references map to `null`. Self-referencing *collections* (`TreeNode.Children`)
+   recurse on the data's actual depth instead. Raise `MaxDepth(n)` as needed.
 9. **`ProjectTo` takes the `MapperConfiguration`**, not the `IMapper`, and cannot use
-   resolvers/hooks/polymorphism (not SQL-translatable).
+   resolvers/hooks/polymorphism (not SQL-translatable). Its cache is per-configuration.
 10. **`Mapper` is a thread-safe singleton** — build one, share it; first call per pair
     pays one-time compilation.
-11. **Records / ctor-only types** → use `ConstructUsing`.
+11. **`ConvertUsing` converters are global, win over every built-in rule, and never see
+    null** — a null source value becomes `default` without invoking the lambda.
 12. **Call `AssertConfigurationIsValid()` at startup** to fail fast on unmapped members.
 13. **`Map<TDst>(source)` infers from the runtime type** — `source` must not be `null`
     (no type to infer), and a derived instance registered only via its base pair
@@ -495,6 +574,7 @@ Dest dest = mapper.Map<Source, Dest>(source);
 
 | Version | Highlights |
 |---|---|
+| **7.0.0** | **Nested collection properties** map automatically in both engines (`ProjectTo` emits a SQL-translatable nested `Select`); **constructor-parameter mapping** for positional records / immutable types; **global `ConvertUsing` converters** (null-safe, both engines); **accumulating hooks** + DI-resolved `IMappingAction` classes; per-configuration projection cache; SourceLink + snupkg symbols + deterministic CI builds. |
 | **6.0.0** | Multi-targets **net8.0 + net10.0** (per-TFM dependencies); new boilerplate-free `Map<TDestination>(source)` overload with runtime source-type inference (collections, LINQ sequences, and `Include<>` polymorphism all supported); explicit-overload hot path unchanged. |
 | **5.1.x** | `Include<>` polymorphic dispatch extended to collection elements and nested members; standalone documentation. |
 | **5.0.0** | DI-resolved value resolvers (`MapFrom<TResolver,TMember>()`), `ForAllMembers`, identity-based collection diffing (`EqualityComparison`). |

@@ -23,9 +23,19 @@ namespace ProjectIMap
         // this replaces the default `new TDestination()` (or requirement thereof) during compilation.
         private readonly ConcurrentDictionary<(Type, Type), LambdaExpression> _customConstructors = new();
 
-        // Lifecycle hooks, keyed by (SourceType, DestType). Stored as boxed Action<TSource,TDestination>.
-        private readonly ConcurrentDictionary<(Type, Type), Delegate> _beforeMap = new();
-        private readonly ConcurrentDictionary<(Type, Type), Delegate> _afterMap  = new();
+        // Lifecycle hooks, keyed by (SourceType, DestType). Each entry is either a
+        // boxed Action<TSource,TDestination> or a Type implementing
+        // IMappingAction<TSource,TDestination> (resolved from the Mapper's
+        // IServiceProvider on every call). Hooks accumulate and run in registration
+        // order — a second registration adds, it never replaces. Mutated only at
+        // configuration time, so a simple lock on each list suffices.
+        private readonly ConcurrentDictionary<(Type, Type), List<object>> _beforeMap = new();
+        private readonly ConcurrentDictionary<(Type, Type), List<object>> _afterMap  = new();
+
+        // Global type converters, keyed by (SourceType, DestType) of the VALUE being
+        // adapted (not the mapped pair). Applied by both compilers with precedence
+        // over every built-in adaptation rule, wherever a member's value adapts.
+        private readonly ConcurrentDictionary<(Type, Type), LambdaExpression> _typeConverters = new();
 
         // Per-pair override for the DFS self-reference recursion depth (see Mapper's
         // visitedPath guard). Default of 1 means "a pair may appear once on the DFS
@@ -140,22 +150,82 @@ namespace ProjectIMap
 
         // ── Lifecycle hooks (BeforeMap / AfterMap) ──────────────────────────────
 
-        internal void SetBeforeMap(Type source, Type destination, Delegate hook)
-            => _beforeMap[(source, destination)] = hook;
+        internal void AddBeforeMap(Type source, Type destination, object hookEntry)
+        {
+            var list = _beforeMap.GetOrAdd((source, destination), static _ => []);
+            lock (list) list.Add(hookEntry);
+        }
 
-        internal void SetAfterMap(Type source, Type destination, Delegate hook)
-            => _afterMap[(source, destination)] = hook;
+        internal void AddAfterMap(Type source, Type destination, object hookEntry)
+        {
+            var list = _afterMap.GetOrAdd((source, destination), static _ => []);
+            lock (list) list.Add(hookEntry);
+        }
 
-        internal bool TryGetBeforeMap(Type source, Type destination, out Delegate? hook)
-            => _beforeMap.TryGetValue((source, destination), out hook);
+        /// <summary>
+        /// Snapshot of the registered BeforeMap entries for a pair, in registration
+        /// order. Each entry is either a boxed <c>Action&lt;TSource,TDestination&gt;</c>
+        /// or a <see cref="Type"/> implementing <c>IMappingAction&lt;TSource,TDestination&gt;</c>.
+        /// Empty array when none are registered.
+        /// </summary>
+        internal object[] GetBeforeMaps(Type source, Type destination)
+        {
+            if (!_beforeMap.TryGetValue((source, destination), out var list)) return [];
+            lock (list) return list.ToArray();
+        }
 
-        internal bool TryGetAfterMap(Type source, Type destination, out Delegate? hook)
-            => _afterMap.TryGetValue((source, destination), out hook);
+        /// <inheritdoc cref="GetBeforeMaps"/>
+        internal object[] GetAfterMaps(Type source, Type destination)
+        {
+            if (!_afterMap.TryGetValue((source, destination), out var list)) return [];
+            lock (list) return list.ToArray();
+        }
 
         internal bool HasLifecycleHooksOrCustomConstructor(Type source, Type destination)
             => _beforeMap.ContainsKey((source, destination))
             || _afterMap.ContainsKey((source, destination))
             || _customConstructors.ContainsKey((source, destination));
+
+        // ── Global type converters (ConvertUsing) ───────────────────────────────
+
+        /// <summary>
+        /// Registers a global type converter applied wherever a value of
+        /// <typeparamref name="TValueSource"/> must become a
+        /// <typeparamref name="TValueDestination"/> during member adaptation —
+        /// across <b>every</b> registered pair, in both the runtime engine and
+        /// <c>ProjectTo</c> projections (the lambda is inlined, so it stays
+        /// SQL-translatable if its body is).
+        /// </summary>
+        /// <remarks>
+        /// Converters take precedence over every built-in adaptation rule,
+        /// including direct assignability — registering
+        /// <c>ConvertUsing&lt;string, string&gt;(s =&gt; s.Trim())</c> transforms every
+        /// string-to-string member in the configuration. Converters never observe
+        /// <see langword="null"/>: a null source value propagates as
+        /// <c>default(TValueDestination)</c> without invoking the lambda, so
+        /// converters like <c>s =&gt; s.Trim()</c> are inherently null-safe. Explicit per-member
+        /// <c>ForMember(... MapFrom ...)</c> overrides are unaffected in what they
+        /// produce, but their <em>result</em> value is also converter-adapted when
+        /// its type requires conversion to the destination member's type.
+        /// </remarks>
+        /// <example>
+        /// <code>
+        /// config.ConvertUsing&lt;string, Guid&gt;(s =&gt; Guid.Parse(s));
+        /// config.ConvertUsing&lt;DateTime, string&gt;(d =&gt; d.ToString("O"));
+        /// </code>
+        /// </example>
+        public MapperConfiguration ConvertUsing<TValueSource, TValueDestination>(
+            System.Linq.Expressions.Expression<Func<TValueSource, TValueDestination>> conversion)
+        {
+            ArgumentNullException.ThrowIfNull(conversion);
+            _typeConverters[(typeof(TValueSource), typeof(TValueDestination))] = conversion;
+            return this;
+        }
+
+        internal bool TryGetTypeConverter(
+            Type source, Type destination,
+            out System.Linq.Expressions.LambdaExpression? converter)
+            => _typeConverters.TryGetValue((source, destination), out converter);
 
         // ── Recursion depth (MaxDepth) ──────────────────────────────────────────
 
@@ -261,11 +331,28 @@ namespace ProjectIMap
             foreach (var (pair, ctor) in other._customConstructors)
                 _customConstructors[pair] = ctor;
 
-            foreach (var (pair, hook) in other._beforeMap)
-                _beforeMap[pair] = hook;
+            foreach (var (pair, otherHooks) in other._beforeMap)
+            {
+                var list = _beforeMap.GetOrAdd(pair, static _ => []);
+                lock (list)
+                {
+                    lock (otherHooks)
+                        list.AddRange(otherHooks);
+                }
+            }
 
-            foreach (var (pair, hook) in other._afterMap)
-                _afterMap[pair] = hook;
+            foreach (var (pair, otherHooks) in other._afterMap)
+            {
+                var list = _afterMap.GetOrAdd(pair, static _ => []);
+                lock (list)
+                {
+                    lock (otherHooks)
+                        list.AddRange(otherHooks);
+                }
+            }
+
+            foreach (var (pair, converter) in other._typeConverters)
+                _typeConverters[pair] = converter;
 
             foreach (var (pair, depth) in other._maxDepth)
                 _maxDepth[pair] = depth;
