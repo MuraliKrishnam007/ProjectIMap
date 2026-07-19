@@ -7,7 +7,7 @@
 
     <!-- NuGet package identity -->
     <PackageId>ProjectIMap</PackageId>
-    <Version>5.1.0</Version>
+    <Version>5.1.1</Version>
     <Authors>ProjectIMap Contributors</Authors>
     <Title>ProjectIMap</Title>
     <Description>
