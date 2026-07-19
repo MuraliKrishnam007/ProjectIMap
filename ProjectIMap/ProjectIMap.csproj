@@ -36,6 +36,10 @@
     </Description>
     <PackageTags>mapper;dto;expression-tree;object-mapping;performance;dependency-injection</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/MuraliKrishnam007/ProjectIMap</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/MuraliKrishnam007/ProjectIMap</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
 
     <!-- Build output -->
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
@@ -47,6 +51,10 @@
 
   <ItemGroup>
     <None Include="JuniorJr.png">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\README.md">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
