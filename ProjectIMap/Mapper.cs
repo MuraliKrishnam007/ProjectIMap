@@ -36,6 +36,13 @@ namespace ProjectIMap
         // pattern as CompileElementMapper) then invoked with zero further reflection.
         private readonly ConcurrentDictionary<(Type, Type), Delegate> _polymorphicDispatch = new();
 
+        // Func<object,TDestination> dispatchers for the runtime-type-inferred
+        // Map<TDestination>(object) overload, keyed by (runtime source type,
+        // destination type). Compiled once per combination; afterwards the overload
+        // costs one cache lookup before invoking the same compiled delegate the
+        // explicit two-generic overload uses.
+        private readonly ConcurrentDictionary<(Type, Type), Delegate> _inferredDispatch = new();
+
         // Polymorphism-aware element/nested mappers, keyed by the element (or nested)
         // (source, destination) pair. Deliberately separate from _compiledMaps: that
         // cache's base-pair slot must stay the plain base MemberInit delegate (the
@@ -207,6 +214,91 @@ namespace ProjectIMap
             return destination;
         }
 
+        /// <inheritdoc/>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when no mapping is registered from the runtime type of
+        /// <paramref name="source"/> (or any of its base types) to
+        /// <typeparamref name="TDestination"/>.
+        /// </exception>
+        public TDestination Map<TDestination>(object source)
+        {
+            if (source is null)
+                throw new ArgumentNullException(
+                    nameof(source),
+                    "Map<TDestination>(source) infers the source type from the object's " +
+                    "runtime type — a null reference carries no type to infer from. " +
+                    "Use the explicit Map<TSource, TDestination>(source) overload if the " +
+                    "source may be null.");
+
+            var runtimeType = source.GetType();
+            var destType    = typeof(TDestination);
+
+            var dispatch = (Func<object, TDestination>)_inferredDispatch.GetOrAdd(
+                (runtimeType, destType), _ => CompileInferredDispatch<TDestination>(runtimeType));
+
+            return dispatch(source);
+        }
+
+        /// <summary>
+        /// Compiles the dispatcher backing <see cref="Map{TDestination}(object)"/> for
+        /// one (runtime source type, destination) combination: resolves which source
+        /// type to dispatch as (see <see cref="ResolveInferredSourceType"/>), then emits
+        /// <c>src =&gt; this.Map&lt;TResolvedSource, TDestination&gt;((TResolvedSource)src)</c>
+        /// so the call flows through the full existing pipeline — collection handling,
+        /// Include&lt;&gt; dispatch, hooks, ConstructUsing, everything.
+        /// </summary>
+        private Func<object, TDestination> CompileInferredDispatch<TDestination>(Type runtimeType)
+        {
+            var destType = typeof(TDestination);
+            var srcType  = ResolveInferredSourceType(runtimeType, destType);
+
+            var mapMethod = typeof(Mapper)
+                .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .First(m => m.Name == nameof(Map) && m.IsGenericMethod
+                         && m.GetGenericArguments().Length == 2
+                         && m.GetParameters().Length == 1)
+                .MakeGenericMethod(srcType, destType);
+
+            var sourceObjParam = Expression.Parameter(typeof(object), "source");
+            var call = Expression.Call(
+                Expression.Constant(this), mapMethod, Expression.Convert(sourceObjParam, srcType));
+
+            return Expression.Lambda<Func<object, TDestination>>(call, sourceObjParam).Compile();
+        }
+
+        /// <summary>
+        /// Picks the source type the inferred overload should dispatch as.
+        /// </summary>
+        /// <remarks>
+        /// <list type="number">
+        ///   <item>Collections dispatch on the runtime type directly — the collection
+        ///   path resolves and validates the element pair itself.</item>
+        ///   <item>An exactly-registered runtime type wins.</item>
+        ///   <item>Otherwise base types are walked, so a derived instance whose only
+        ///   registration is its base pair (typically with <c>Include&lt;&gt;</c> on
+        ///   the base) dispatches as that base — the existing polymorphic machinery
+        ///   then maps it to the correct derived destination.</item>
+        ///   <item>Nothing registered anywhere → return the runtime type unchanged and
+        ///   let <see cref="Map{TSource,TDestination}(TSource)"/> throw its standard,
+        ///   actionable "No mapping registered" message.</item>
+        /// </list>
+        /// </remarks>
+        private Type ResolveInferredSourceType(Type runtimeType, Type destType)
+        {
+            if (TryGetCollectionElementType(runtimeType, out _) &&
+                TryGetCollectionElementType(destType, out _))
+                return runtimeType;
+
+            if (_configuration.IsRegistered(runtimeType, destType))
+                return runtimeType;
+
+            for (var t = runtimeType.BaseType; t is not null; t = t.BaseType)
+                if (_configuration.IsRegistered(t, destType))
+                    return t;
+
+            return runtimeType;
+        }
+
         /// <summary>
         /// Construct-then-assign pipeline used for pairs with a custom constructor
         /// and/or BeforeMap/AfterMap hooks registered. See <see cref="IMappingExpression{TSource,TDestination}.ConstructUsing"/>,
@@ -263,7 +355,11 @@ namespace ProjectIMap
         {
             var mapMethod = typeof(Mapper)
                 .GetMethods(BindingFlags.Public | BindingFlags.Instance)
-                .First(m => m.Name == nameof(Map) && m.IsGenericMethod && m.GetParameters().Length == 1)
+                // Two generic args required: the single-generic Map<TDestination>(object)
+                // overload also has exactly one parameter and must not match here.
+                .First(m => m.Name == nameof(Map) && m.IsGenericMethod
+                         && m.GetGenericArguments().Length == 2
+                         && m.GetParameters().Length == 1)
                 .MakeGenericMethod(derivedSrc, derivedDst);
 
             var sourceObjParam = Expression.Parameter(typeof(object), "source");

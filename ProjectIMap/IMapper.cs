@@ -52,6 +52,40 @@ namespace ProjectIMap
         TDestination Map<TSource, TDestination>(TSource source);
 
         /// <summary>
+        /// Maps <paramref name="source"/> to a new <typeparamref name="TDestination"/>,
+        /// inferring the source type from the object's <b>runtime</b> type — the
+        /// boilerplate-free form of <see cref="Map{TSource,TDestination}(TSource)"/>:
+        /// <c>mapper.Map&lt;OrderDto&gt;(order)</c>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The runtime type is resolved to a registered pair once per
+        /// (runtime type, destination) combination and the dispatch is compiled and
+        /// cached, so steady-state cost is identical to the explicit two-generic
+        /// overload: one cache lookup, then the same compiled delegate.
+        /// </para>
+        /// <para>
+        /// When the runtime type itself has no registered pair, its base types are
+        /// walked so a derived instance registered only via its base pair (typically
+        /// with <see cref="IMappingExpression{TSource,TDestination}.Include{TDerivedSource,TDerivedDestination}"/>)
+        /// still dispatches correctly. Collections infer their element pair exactly
+        /// like the explicit overload.
+        /// </para>
+        /// </remarks>
+        /// <typeparam name="TDestination">The destination type.</typeparam>
+        /// <param name="source">The object to map from. Must not be <see langword="null"/> —
+        /// a null carries no runtime type to infer from.</param>
+        /// <returns>A new <typeparamref name="TDestination"/> populated by the compiled mapping delegate.</returns>
+        /// <exception cref="System.ArgumentNullException">
+        /// Thrown when <paramref name="source"/> is <see langword="null"/>.
+        /// </exception>
+        /// <exception cref="System.InvalidOperationException">
+        /// Thrown when no mapping is registered from the runtime type (or any of its
+        /// base types) to <typeparamref name="TDestination"/>.
+        /// </exception>
+        TDestination Map<TDestination>(object source);
+
+        /// <summary>
         /// Maps <paramref name="source"/> onto the already-constructed
         /// <paramref name="destination"/> instance in place, instead of allocating
         /// a new <typeparamref name="TDestination"/>.

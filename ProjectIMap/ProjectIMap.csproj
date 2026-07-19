@@ -1,13 +1,14 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
     <!-- NuGet package identity -->
     <PackageId>ProjectIMap</PackageId>
-    <Version>5.1.1</Version>
+    <Version>6.0.0</Version>
     <Authors>ProjectIMap Contributors</Authors>
     <Title>ProjectIMap</Title>
     <Description>
@@ -33,6 +34,10 @@
       of a mapped collection and nested complex members now map on their runtime type
       (a Dog inside a List&lt;Animal&gt;, or a nested Animal member holding a Dog, maps
       to DogDto), paid only for pairs that declare Include&lt;&gt;.
+      v6.0 multi-targets net8.0 and net10.0 (LTS coverage back to .NET 8) and adds the
+      boilerplate-free Map&lt;TDestination&gt;(source) overload that infers the source
+      type from the object's runtime type — dispatch is resolved once, compiled, and
+      cached, and the explicit two-generic path is unchanged.
     </Description>
     <PackageTags>mapper;dto;expression-tree;object-mapping;performance;dependency-injection</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -60,9 +65,13 @@
     </None>
   </ItemGroup>
 
-  <ItemGroup>
-    <!-- Abstractions only: avoids pulling in the full DI container implementation.
-         Consumers that already reference the full package will use their copy. -->
+  <!-- Abstractions only: avoids pulling in the full DI container implementation.
+       Consumers that already reference the full package will use their copy.
+       Version is per-TFM so net8.0 apps aren't forced onto the 10.x dependency line. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.2" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
   </ItemGroup>
 
