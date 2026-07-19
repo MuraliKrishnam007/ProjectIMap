@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="ProjectIMap.csproj" />
+  <Project Path="..\ProjectIMap.Tests\ProjectIMap.Tests.csproj" />
+  <Project Path="..\ProjectIMap.Benchmarks\ProjectIMap.Benchmarks.csproj" />
+</Solution>

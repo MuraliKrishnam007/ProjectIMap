@@ -1,0 +1,61 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- NuGet package identity -->
+    <PackageId>ProjectIMap</PackageId>
+    <Version>5.1.0</Version>
+    <Authors>ProjectIMap Contributors</Authors>
+    <Title>ProjectIMap</Title>
+    <Description>
+      A high-performance object-to-object mapper for .NET. Mapping delegates are
+      compiled once per type pair via Expression Trees and cached for the lifetime
+      of the IMapper instance — no reflection, no boxing, on the hot path.
+      Supports bi-directional mapping, property flattening, unflattening, nullable
+      coercion, numeric widening, enum conversion, collection mapping with DFS
+      cycle detection, and EF Core-compatible ProjectTo SQL projection.
+      v3.0 added mapping into an existing instance, ConstructUsing for types without
+      a parameterless constructor, per-member Condition and NullSubstitute, BeforeMap
+      / AfterMap lifecycle hooks, configurable recursion depth (MaxDepth) for
+      self-referencing types, and AssertConfigurationIsValid startup validation.
+      v4.0 added collection merge into an existing collection, configurable
+      flatten/unflatten lookahead depth (FlattenDepth), reusable IValueResolver
+      classes for ForMember, polymorphic/inheritance mapping (Include), and
+      recursive AssertConfigurationIsValid into nested complex-type pairs.
+      v5.0 adds DI-resolved value resolvers (MapFrom&lt;TResolver,TMember&gt;()
+      via a Mapper constructed with an IServiceProvider), ForAllMembers blanket
+      per-pair member rules, and identity-based collection diffing
+      (EqualityComparison) for add/update/remove merges into an existing collection.
+      v5.1 extends Include-based polymorphic dispatch beyond top-level calls: elements
+      of a mapped collection and nested complex members now map on their runtime type
+      (a Dog inside a List&lt;Animal&gt;, or a nested Animal member holding a Dog, maps
+      to DogDto), paid only for pairs that declare Include&lt;&gt;.
+    </Description>
+    <PackageTags>mapper;dto;expression-tree;object-mapping;performance;dependency-injection</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+
+    <!-- Build output -->
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Suppress CS1591 (missing XML doc) globally; tighten per-project as needed -->
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <PackageIcon>JuniorJr.png</PackageIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="JuniorJr.png">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Abstractions only: avoids pulling in the full DI container implementation.
+         Consumers that already reference the full package will use their copy. -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

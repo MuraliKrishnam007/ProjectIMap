@@ -1,0 +1,32 @@
+# ── Build output ─────────────────────────────────────────────────────────────
+[Bb]in/
+[Oo]bj/
+out/
+*.nupkg
+*.snupkg
+
+# ── Local backup of the removed source generator (kept aside as a safety net) ──
+# Version control now supersedes this backup; force-add it if you want it tracked.
+ProjectIMap.SourceGenerator.bak/
+
+# ── IDE / tooling ────────────────────────────────────────────────────────────
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# ── Rider / ReSharper ────────────────────────────────────────────────────────
+_ReSharper*/
+*.DotSettings.user
+
+# ── Test / coverage artifacts ────────────────────────────────────────────────
+[Tt]est[Rr]esults/
+*.coverage
+*.coveragexml
+
+# ── OS cruft ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
